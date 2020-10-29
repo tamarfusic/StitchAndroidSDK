@@ -155,7 +155,7 @@ public class CameraSurfaceViewPreview extends SurfaceView implements SurfaceHold
         List<Camera.Size> sizes = parameters.getSupportedPreviewSizes();
         Camera.Size selectedSize = CameraHelpers.pickBestSize(sizes, requestSize.width, requestSize.height,true);
         bestSize = new Size(selectedSize.width,selectedSize.height);
-
+        Log.e("tamar", "==========parameters.setPreviewSize width="+bestSize.width+"     height"+bestSize.height);
         parameters.setPreviewSize(bestSize.width, bestSize.height);
         parameters.setRotation(options.finalRotation);
         try {

@@ -10,6 +10,7 @@ public class Character {
     public String frames_path;
     public String  audio_path;
     public int fps;
+    public int bitrate;
     public String orientation;
     public int width;
     public int height;
@@ -120,6 +121,14 @@ public class Character {
 
     public void setUser_id(int user_id) {
         this.user_id = user_id;
+    }
+
+    public int getBitrate() {
+        return bitrate;
+    }
+
+    public void setBitrate(int bitrate) {
+        this.bitrate = bitrate;
     }
 
     public void print() {

@@ -2,11 +2,15 @@ package com.fusit.stitchutils;
 
 import android.app.Activity;
 import android.content.Intent;
+import android.content.pm.ActivityInfo;
+import android.media.AudioManager;
 import android.media.MediaPlayer;
 import android.net.Uri;
 import android.support.v7.app.AppCompatActivity;
 import android.os.Bundle;
 import android.util.Log;
+import android.view.SurfaceHolder;
+import android.view.SurfaceView;
 import android.view.View;
 import android.widget.ImageView;
 import android.widget.MediaController;
@@ -26,53 +30,72 @@ import java.text.SimpleDateFormat;
 import java.util.Date;
 
 
-public class ShareStitch extends AppCompatActivity {
+public class ShareStitch extends AppCompatActivity implements SurfaceHolder.Callback, MediaPlayer.OnPreparedListener, MediaPlayer.OnCompletionListener {
 
+    public static final String ACTIVITY_ORIENTATION = "ACTIVITY_ORIENTATION";
     public static final String RECORDER_FILE_PATH = "RECORDER_FILE_PATH";
     public static final String RECORDER_FILE_LENGTH = "RECORDER_FILE_LENGTH";
+    public static final String SHOULD_EXIT_LIBRARY = "SHOULD_EXIT_LIBRARY";
     private File stitchedFile;
     private File ShareableStitchedFile;
     public static File vidsDirectory;
-    private VideoView videoView;
+    private SurfaceView vidSurface;
+    private SurfaceHolder vidHolder;
     private double clipLength;
     private boolean showInstagramShare;
     private boolean showFacebookShare;
     private boolean showTiktokShare;
     private boolean showMoreShare;
-    private ImageView shareTiktok, shareFacebook, shareInstagram, shareMore;
+//    private File fileToPlay;
+    private MediaPlayer mediaPlayer;
+    private ImageView shareTiktok, shareFacebook, shareInstagram, shareMore, playBtn;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        setContentView(R.layout.activity_share_stitch);
+        Log.e("tamar", "-----in share oncreate=");
         initVideoDirectory();
-        shareTiktok = (ImageView)findViewById(R.id.share_tiktok);
-        shareFacebook = (ImageView)findViewById(R.id.share_fb);
-        shareInstagram = (ImageView)findViewById(R.id.share_instagram);
-        shareMore = (ImageView)findViewById(R.id.share_more);
+        setContentView(R.layout.activity_share_stitch);
         handleIntent();
+        vidSurface = (SurfaceView)findViewById(R.id.stitched_video_preview);
+        vidHolder = vidSurface.getHolder();
+        vidHolder.addCallback(this);
+        playBtn = (ImageView)findViewById(R.id.play_btn);
+
+
     }
 
     private void playVideo(String fileToPlay) {
-        videoView = (VideoView)findViewById(R.id.stitched_video_preview);
+        Log.e("tamar", "-----in share playVideo=");
+//        vidSurface = (SurfaceView)findViewById(R.id.stitched_video_preview);
+//        vidHolder = vidSurface.getHolder();
+//        vidHolder.addCallback(this);
+
+//        this.fileToPlay = fileToPlay;
+        try {
+            mediaPlayer.setDataSource(fileToPlay);
+            mediaPlayer.prepare();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
 //        videoView = (VideoView)findViewById(R.id.video_preview);
 //        toggleVideoView(true);
-        MediaController mediaController=new MediaController(this);
-        mediaController.setAnchorView(videoView);
-//        Uri videoToPlay = Uri.parse("https:" + url);
-        videoView.setMediaController(mediaController);
-//        videoView.setVideoURI(videoToPlay);
-
-        videoView.setVideoURI(Uri.parse(fileToPlay));
-
-
-        videoView.setOnCompletionListener(new MediaPlayer.OnCompletionListener() {
-            @Override
-            public void onCompletion(MediaPlayer mediaPlayer) {
-//                toggleVideoView(false);
-            }
-        });
-        videoView.start();
+//        MediaController mediaController=new MediaController(this);
+//        mediaController.setAnchorView(videoView);
+////        Uri videoToPlay = Uri.parse("https:" + url);
+//        videoView.setMediaController(mediaController);
+////        videoView.setVideoURI(videoToPlay);
+//
+//        videoView.setVideoURI(Uri.parse(fileToPlay));
+//
+//
+//        videoView.setOnCompletionListener(new MediaPlayer.OnCompletionListener() {
+//            @Override
+//            public void onCompletion(MediaPlayer mediaPlayer) {
+////                toggleVideoView(false);
+//            }
+//        });
+//        videoView.start();
     }
 
     private void initVideoDirectory() {
@@ -84,15 +107,19 @@ public class ShareStitch extends AppCompatActivity {
     private void handleIntent() {
         Intent intent = getIntent();
         if (intent.hasExtra(RECORDER_FILE_PATH)) {
+            setActivityOrientation(intent.getStringExtra(ACTIVITY_ORIENTATION));
             String recordedFilePath = intent.getStringExtra(RECORDER_FILE_PATH);
             stitchedFile = new File(recordedFilePath);
             clipLength = intent.getDoubleExtra(RECORDER_FILE_LENGTH, 0);
             Log.e("tamar", "-----clipLength="+clipLength+"-------");
-            playVideo(recordedFilePath);
+//            playVideo(recordedFilePath);
             String timestamp = new SimpleDateFormat("yyyyMMddhhmmss").format(new Date());
             ShareableStitchedFile = new File(vidsDirectory.getAbsolutePath() + File.separator + "video_"+ timestamp +".mp4");
             copyFile(stitchedFile, ShareableStitchedFile);
-
+            shareTiktok = (ImageView)findViewById(R.id.share_tiktok);
+            shareFacebook = (ImageView)findViewById(R.id.share_fb);
+            shareInstagram = (ImageView)findViewById(R.id.share_instagram);
+            shareMore = (ImageView)findViewById(R.id.share_more);
             showInstagramShare = intent.getBooleanExtra(StitchActivity.SHARE_TO_INSTAGRAM, false);
             if(showInstagramShare) {
                 shareInstagram.setVisibility(View.VISIBLE);
@@ -118,6 +145,18 @@ public class ShareStitch extends AppCompatActivity {
                 shareTiktok.setVisibility(View.GONE);
             }
         }//stitchedFile = "/storage/emulated/0/Download/fuse.it/withwm_story.mp4";
+    }
+
+    private void setActivityOrientation(String orientation) {
+        Log.e("tamar", "in setActivityOrientation!!!s orientation="+orientation);
+        if(orientation.equalsIgnoreCase("horizontal")) {
+//            setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_PORTRAIT);
+            setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE);
+
+        } else {
+            setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_PORTRAIT);
+
+        }
     }
 
     private void copyFile(File fromLocation, File toLocation) {
@@ -173,23 +212,80 @@ public class ShareStitch extends AppCompatActivity {
     }
 
     public void onBackClicked(View view) {
-        onBackPressed();
+        Intent data = new Intent();
+        data.putExtra(SHOULD_EXIT_LIBRARY,false);
+        setResult(Activity.RESULT_OK, data);
+        finish();
+//        finishAndRemoveTask();
+    }
 
+    public void onCloseClicked(View view) {
+        Intent data = new Intent();
+        data.putExtra(SHOULD_EXIT_LIBRARY,true);
+        setResult(Activity.RESULT_OK, data);
+        finish();
     }
 
     @Override
     public void onBackPressed() {
-        super.onBackPressed();
-        Log.e("tamar", "in onBackPressed set result OK-----");
-        if (getParent() == null) {
-            Log.e("tamar", "in onBackPressed set result OK----- 1");
-            setResult(Activity.RESULT_OK);
+        onCloseClicked(null);
+//        super.onBackPressed();
+    }
+
+    @Override
+    public void surfaceCreated(SurfaceHolder holder) {
+        try {
+            mediaPlayer = new MediaPlayer();
+            mediaPlayer.setDisplay(vidHolder);
+            mediaPlayer.setDataSource(stitchedFile.getAbsolutePath());
+            mediaPlayer.prepare();
+            mediaPlayer.setOnPreparedListener(this);
+            mediaPlayer.setOnCompletionListener(this);
+            mediaPlayer.setAudioStreamType(AudioManager.STREAM_MUSIC);
         }
-        else {
-            Log.e("tamar", "in onBackPressed set result OK----- 2");
-            getParent().setResult(Activity.RESULT_OK);
+        catch(Exception e){
+            e.printStackTrace();
         }
-//        setResult(RESULT_OK);
-        finish();
+    }
+
+    @Override
+    public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
+
+    }
+
+    @Override
+    public void surfaceDestroyed(SurfaceHolder holder) {
+
+    }
+
+    @Override
+    public void onPrepared(MediaPlayer mp) {
+//        mp.setLooping(true);
+        mp.start();
+    }
+
+    @Override
+    public void onStop(){
+        super.onStop();
+        if(mediaPlayer!=null){
+            mediaPlayer.release();
+            mediaPlayer=null;
+        }
+    }
+
+    @Override
+    public void onDestroy() {
+        super.onDestroy();
+        mediaPlayer=null;
+    }
+
+    @Override
+    public void onCompletion(MediaPlayer mp) {
+        playBtn.setVisibility(View.VISIBLE);
+    }
+
+    public void onPlayClicked(View view) {
+        playBtn.setVisibility(View.INVISIBLE);
+        mediaPlayer.start();
     }
 }

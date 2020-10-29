@@ -4,6 +4,8 @@ import android.Manifest;
 import android.annotation.TargetApi;
 import android.app.Activity;
 import android.app.Dialog;
+import android.content.Context;
+import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.pm.ActivityInfo;
 import android.content.pm.PackageManager;
@@ -16,10 +18,12 @@ import android.media.MediaRecorder;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Environment;
+import android.os.SystemClock;
 import android.text.TextUtils;
 import android.transition.Transition;
 import android.transition.TransitionManager;
 import android.util.Log;
+import android.util.Size;
 import android.view.Gravity;
 import android.view.Surface;
 import android.view.SurfaceHolder;
@@ -52,6 +56,8 @@ import com.fusit.stitchutils.network.RequestManager;
 import com.fusit.stitchutils.network.RequestType;
 import com.fusit.stitchutils.network.VRequest;
 import com.fusit.stitchutils.network.VolleyMultipartRequest;
+import com.fusit.stitchutils.utils.AlertDialogContentFactory;
+import com.fusit.stitchutils.utils.AlertDialogType;
 import com.fusit.stitchutils.utils.CameraPreviewBase;
 import com.fusit.stitchutils.utils.Character;
 import com.fusit.stitchutils.utils.OKHttpFileDownloader;
@@ -77,7 +83,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
 
-public class StitchActivity extends /*AppCompat*/ Activity implements MediaPlayer.OnVideoSizeChangedListener, MediaPlayer.OnPreparedListener, RequestListener, SurfaceHolder.Callback {
+public class StitchActivity extends /*AppCompat*/ Activity implements MediaPlayer.OnVideoSizeChangedListener, MediaPlayer.OnPreparedListener, RequestListener, SurfaceHolder.Callback, AudioManager.OnAudioFocusChangeListener {
 
     private static final int SHARE_ACTIVITY_REQ_CODE = 148;
     private static String videoName;
@@ -87,7 +93,6 @@ public class StitchActivity extends /*AppCompat*/ Activity implements MediaPlaye
     private SurfaceView vidSurface;
 //    private VideoView videoView;
     private MediaPlayer mediaPlayer;
-    private boolean isMediaPlayerReleased;
     FrameLayout loadingScreen, camerPreview;
     RelativeLayout rootView;
     RecorderCamera camera;
@@ -112,9 +117,10 @@ public class StitchActivity extends /*AppCompat*/ Activity implements MediaPlaye
     public static final String SHARE_TO_MORE = "SHARE_TO_MORE";
     public static final String STITCHED_FILE_PATH = "STITCHED_FILE_PATH";
     public static final int REQUEST_ID_MULTIPLE_PERMISSIONS = 111;
+    private ScheduledExecutorService progressService;
 
     private String currentOutputFile;
-    private ImageView recBtn, stopBtn;
+    private ImageView recBtn, stopBtn, cancelRecBtn;
     private ProgressBar progressBar;
     private int progressStatus = 0;
     private int videoDuration;
@@ -132,33 +138,66 @@ public class StitchActivity extends /*AppCompat*/ Activity implements MediaPlaye
     List<String> permissionsNeverGrantedList = new ArrayList<>();
     private static final int SETTINGS_RC = 18;
     private File fileToPlay;
+    private boolean videoWasPaused = false;
+    private boolean isMediaPlayerReleased = true;
+    public static final int ORIGINAL_FPS = 25;
+    public static final int MS_PER_FRAME = 1000/ORIGINAL_FPS;
+    public static final int MINIMUM_RECORD_TIME = 12;
+    private AudioManager audioManager;
+    private File downloadFile;
 
+
+    public enum Stage{
+        STITCHED_VIDEO_DOWNLOADING
+        ,RECORDING
+        , ABORTED
+        , PAUSED
+        , STARTED
+        , CANCELLED
+        , UPLOAD_USER_VIDEO
+        , CALL_STITCH_API
+        , CALL_SHARE
+    }
+    volatile Stage currentStage;
+
+    public Stage getCurrentStage() {
+        return currentStage;
+    }
+
+    public void setCurrentStage(Stage currentStage) {
+        this.currentStage = currentStage;
+    }
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-//        Display display = getWindowManager().getDefaultDisplay();
-//        Point size = new Point();
-//        display.getSize(size);
-//        Log.e("tamar", "width="+size.x+"  hieght="+size.y);
-//        int width = size.x;
-//        int height = size.y;
-        if(permissionsAllowed()) {
-            initScreenAndIntent();
 
+        setCurrentStage(Stage.STARTED);
+//        Log.e("tamar", "current stage=" + getCurrentStage().name());
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        if (showPermissionsNeededDialog==null) {
+            if(permissionsAllowed()) {
+                initScreenAndIntent();
+            }
         }
+        audioManager = (AudioManager)getSystemService(Context.AUDIO_SERVICE);
+
     }
 
-    private void initScreen(){
+    private void initScreen(final boolean callApi){
+        Log.e("tamar", "in initScreen callapi="+callApi);
         setContentView(R.layout.activity_stitch);
         loadingScreen = (FrameLayout)findViewById(R.id.loading_screen);
+//        loadingScreen.setVisibility(View.INVISIBLE);
         rootView = (RelativeLayout)findViewById(R.id.root_view);
         rootView.post(new Runnable() {
             @Override public void run() {
-                animateLoadingScreen(true);
+                animateLoadingScreen(callApi);
             }
         });
-        callGetCharacterApi(charID);
+        if(callApi) {
+            callGetCharacterApi(charID);
+        }
 //        vidSurface = (SurfaceView) findViewById(R.id.video_preview);
 //        vidHolder = vidSurface.getHolder();
 //        vidHolder.addCallback(this);
@@ -166,24 +205,36 @@ public class StitchActivity extends /*AppCompat*/ Activity implements MediaPlaye
         recBtn = (ImageView) findViewById(R.id.start_recording);
         stopBtn = (ImageView) findViewById(R.id.stop_recording);
         progressBar = (ProgressBar) findViewById(R.id.line_progress_bar);
+        cancelRecBtn = (ImageView) findViewById(R.id.close_btn);
+//        Log.e("tamar", "finish initScreen");
     }
 
     private void initSurfaceViewPlayer() {
+//        Log.e("tamar", "in initSurfaceViewPlayer");
         vidSurface = (SurfaceView) findViewById(R.id.video_preview);
         vidHolder = vidSurface.getHolder();
         vidHolder.addCallback(this);
         vidHolder.setType(SurfaceHolder.SURFACE_TYPE_PUSH_BUFFERS);
         vidSurface.setZOrderMediaOverlay(true);
+//        Log.e("tamar", "finish initSurfaceViewPlayer");
 //        objVideoView.videoView.setZOrderOnTop(true);
     }
 
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
-        Log.e("tamar", "in onActivityResult1 requestCode="+requestCode+" resultCode="+resultCode);
+        boolean shouldClose = false;
         if(requestCode==SHARE_ACTIVITY_REQ_CODE){ // && resultCode==RESULT_OK) {
-            Log.e("tamar", "in onActivityResult2 requestCode="+requestCode+" resultCode="+resultCode);
-            initScreen();
+            if(data.hasExtra(ShareStitch.SHOULD_EXIT_LIBRARY)) {
+                shouldClose = data.getBooleanExtra(ShareStitch.SHOULD_EXIT_LIBRARY, false);
+            }
+            if(shouldClose) {
+                finish();
+            }
+//            else {
+//                Log.e("tamar", "call initScreen 1"+true);
+//                initScreen(true);
+//            }
         }
         if (requestCode == SETTINGS_RC) {
             if (permissionsAllowed()) {
@@ -198,7 +249,8 @@ public class StitchActivity extends /*AppCompat*/ Activity implements MediaPlaye
 
     private void initScreenAndIntent() {
         handleIntent();
-        initScreen();
+        Log.e("tamar", "call initScreen 1"+true);
+        initScreen(true);
     }
 
 
@@ -216,20 +268,53 @@ public class StitchActivity extends /*AppCompat*/ Activity implements MediaPlaye
 
 
     private void setCameraPriviewSize(int width, int height){
+//        Log.e("tamar", "in setCameraPriviewSize");
         mCamera = getCameraInstance();
         Camera.Parameters parameters = mCamera.getParameters();
-        parameters.setPreviewSize(width, height); //temp hard coded
+//        List<int[]> fpsRange = parameters.getSupportedPreviewFpsRange();
+//        for(int[] nums : fpsRange) {
+//            for(int i=0;i<nums.length;i++){
+//                Log.e("tamar", "in setCameraPriviewSize fps i="+nums[i]);
+//            }
+//            Log.e("tamar", "============================");
+//
+//        }
+//        if (fpsRange.size() == 1) {
+//            //fpsRange.get(0)[0] < CAMERA_PREVIEW_FPS < fpsRange.get(0)[1]
+//            param.setPreviewFpsRange(CAMERA_PREVIEW_FPS, CAMERA_PREVIEW_FPS);
+//        } else {
+//            //pick first from list to limit framerate or last to maximize framerate
+//            param.setPreviewFpsRange(fpsRange.get(0)[0], fpsRange.get(0)[1]);
+//        }
+
+//        List<Camera.Size> allSizes = parameters.getSupportedVideoSizes();
+////        Camera.Size size = allSizes.get(0); // get top size
+//        for (int i = 0; i < allSizes.size(); i++) {
+//            Log.e("tamar","supported video width="+allSizes.get(i).width+ "    supported video height="+allSizes.get(i).height);
+//        }
+
+        List<Camera.Size> allSizes2 = parameters.getSupportedPreviewSizes();
+//        Camera.Size size = allSizes.get(0); // get top size
+        for (int i = 0; i < allSizes2.size(); i++) {
+            Log.e("tamar","supported preview width="+allSizes2.get(i).width+ "    supported preview height="+allSizes2.get(i).height);
+        }
+//        parameters.setPreviewSize(width, height);
+        parameters.setPreviewSize(1088, 1088); //temp hard coded
 
         if (getResources().getConfiguration().orientation == Configuration.ORIENTATION_PORTRAIT)
         {
             parameters.set("orientation", "portrait");
-            parameters.set("rotation",90);
+//            parameters.set("rotation",90);
+            parameters.set("rotation",0);
         }
         if (getResources().getConfiguration().orientation == Configuration.ORIENTATION_LANDSCAPE)
         {
             parameters.set("orientation", "landscape");
             parameters.set("rotation", 90);
         }
+
+
+
 
         mCamera.setParameters(parameters);
 
@@ -271,63 +356,23 @@ public class StitchActivity extends /*AppCompat*/ Activity implements MediaPlaye
 
 
     private void showVideo(File fileToPlay) {
+//        Log.e("tamar", "in showVideo fileToPlay="+fileToPlay);
 //        vidSurface = (SurfaceView) findViewById(R.id.video_preview);
 //        vidHolder = vidSurface.getHolder();
 //        vidHolder.addCallback(this);
         this.fileToPlay = fileToPlay;
         try {
-            mediaPlayer.setDataSource(fileToPlay.getAbsolutePath());
-            mediaPlayer.prepare();
+//            Log.e("tamar", "in showVideo mediaPlayer="+mediaPlayer);
+            if(mediaPlayer!=null) {
+                mediaPlayer.setDataSource(fileToPlay.getAbsolutePath());
+                mediaPlayer.prepare();
+            } else {
+                Log.e("tamar", "in showVideo mediaPlayer IS NULL!!!");
+            }
+
         } catch (IOException e) {
             e.printStackTrace();
         }
-
-//        initSurfaceViewPlayer();
-//        vidSurface.setVideoURI(Uri.parse(fileToPlay.getAbsolutePath()));
-//        videoView.setOnCompletionListener(new MediaPlayer.OnCompletionListener() {
-//            @Override
-//            public void onCompletion(MediaPlayer mediaPlayer) {
-////                toggleVideoView(false);
-//            }
-//        });
-////        videoView.setZOrderOnTop(true);
-////        videoView.requestFocus();
-//        videoView.start();
-//        videoView.requestFocus();
-//        //videoView.setZOrderOnTop(true);
-////        camerPreview.setZOrderOnTop(false);
-//        videoView.setOnPreparedListener(new MediaPlayer.OnPreparedListener() {
-//
-//            public void onPrepared(MediaPlayer mp) {
-////                videoDuration = videoView.getDuration();
-//                mp.setLooping(true);
-//                videoDuration = (int)((double)fCharacter.getLength()*1000);
-//                animateLoadingScreen(false);
-//                //((long)fCharacter.getLength()*1000))
-//                amountToUpdate = videoDuration / 100;
-//                Log.e("tamar", "==============videoDuration="+videoDuration+"   amountToUpdate"+amountToUpdate);
-////                Timer mTimer = new Timer();
-////                mTimer.schedule(new TimerTask() {
-////
-////                    @Override
-////                    public void run() {
-////                        runOnUiThread(new Runnable() {
-////
-////                            @Override
-////                            public void run() {
-////                                if (!(amountToUpdate * progressBar.getProgress() >= videoDuration)) {
-////                                    int p = progressBar.getProgress();
-////                                    p += 1;
-////                                    progressBar.setProgress(p);
-////                                }
-////                            }
-////                        });
-////                    };
-////                }, amountToUpdate);
-//
-////                loadingScreen.setVisibility(View.GONE);
-//            }
-//        });
     }
 
 
@@ -352,7 +397,6 @@ public class StitchActivity extends /*AppCompat*/ Activity implements MediaPlaye
         } else {
             Toast.makeText(this, "Make sure you sent a video id", Toast.LENGTH_SHORT).show();
         }
-
     }
 
     @Override
@@ -373,17 +417,17 @@ public class StitchActivity extends /*AppCompat*/ Activity implements MediaPlaye
 
     @Override
     public void onVideoSizeChanged(MediaPlayer mp, int width, int height) {
-        Log.e("tamar", "------in onVideoSizeChanged width="+width);
+//        Log.e("tamar", "------in onVideoSizeChanged width="+width);
     }
 
     @Override
     public void onPrepared(MediaPlayer mp) {
-        Log.e("tamar", "^^^^^^^^^^^^in onPrepared starting player"); //todo: check if this code is used
+//        Log.e("tamar", "------in onPrepared");
         videoDuration = (int)((double)fCharacter.getLength()*1000);
         animateLoadingScreen(false);
         //((long)fCharacter.getLength()*1000))
         amountToUpdate = videoDuration / 100;
-        Log.e("tamar", "==============videoDuration="+videoDuration+"   amountToUpdate"+amountToUpdate);
+//        Log.e("tamar", "==============videoDuration="+videoDuration+"   amountToUpdate"+amountToUpdate);
         mp.setLooping(true);
         mp.start();
         vidSurface.setVisibility(View.VISIBLE);
@@ -434,17 +478,29 @@ public class StitchActivity extends /*AppCompat*/ Activity implements MediaPlaye
         mCamera = getCameraInstance();
         setCameraDisplayOrientation(this,0,mCamera);
         mediaRecorder = new MediaRecorder();
-        Log.e("tamar", "new MediaRecorder()!!!");
+//        Log.e("tamar", "new MediaRecorder()!!!");
+//        Log.e("tamar", "in prepare cal start MediaRecorder()!!!");
+//        mediaRecorder.setOnInfoListener(new MediaRecorder.OnInfoListener() {
+//            @Override
+//            public void onInfo(MediaRecorder mr, int what, int extra) {
+//                Log.e("tamar", "Recorder INFO="+what);
+//            }
+//        });
         // Step 1: Unlock and set camera to MediaRecorder
         mCamera.unlock();
         mediaRecorder.setCamera(mCamera);
 
         // Step 2: Set sources
-        mediaRecorder.setAudioSource(MediaRecorder.AudioSource.CAMCORDER);
+//        mediaRecorder.setAudioSource(MediaRecorder.AudioSource.);
         mediaRecorder.setVideoSource(MediaRecorder.VideoSource.CAMERA);
 //        mediaRecorder.setVideoSize
         // Step 3: Set a CamcorderProfile (requires API Level 8 or higher)
-        mediaRecorder.setProfile(CamcorderProfile.get(CamcorderProfile.QUALITY_HIGH));
+//        mediaRecorder.setProfile(CamcorderProfile.get(CamcorderProfile.QUALITY_HIGH));
+        CamcorderProfile profile = CamcorderProfile.get(0, CamcorderProfile.QUALITY_HIGH);
+        // Step 3: Set all values contained in profile except audio settings
+        mediaRecorder.setOutputFormat(profile.fileFormat);
+        mediaRecorder.setVideoEncoder(profile.videoCodec);
+        mediaRecorder.setVideoEncodingBitRate(fCharacter.getBitrate());
 
         // Step 4: Set output file
         currentOutputFile = getOutputMediaFile(MEDIA_TYPE_VIDEO).toString();
@@ -452,12 +508,13 @@ public class StitchActivity extends /*AppCompat*/ Activity implements MediaPlaye
 // recorder.setOutputFile(getVideoFolder()+rnd.nextString()+".mp4");
         // Step 5: Set the camerPreview output
         mediaRecorder.setPreviewDisplay(mPreview.getHolder().getSurface());
-        mediaRecorder.setVideoSize(fCharacter.getWidth(), fCharacter.getHeight()); //1920, 1080);
+        Log.e("tamar", " ==============set hardcoded setVideoSize=============");
+        mediaRecorder.setVideoSize(1920, 1080);
+//        mediaRecorder.setVideoSize(fCharacter.getWidth(), fCharacter.getHeight()); //1920, 1080);
         mediaRecorder.setVideoFrameRate(fCharacter.getFps());
-        mediaRecorder.setVideoEncodingBitRate(900000);
+//        mediaRecorder.setVideoEncodingBitRate(900000);
 //        mediaRecorder.setVideoSize(bestSize.width, bestSize.height);
         mediaRecorder.setOrientationHint(orientation);
-        Log.e("tamar", "setOrientationHint=" + orientation);
         // Step 6: Prepare configured MediaRecorder
         try {
             mediaRecorder.prepare();
@@ -537,24 +594,30 @@ public class StitchActivity extends /*AppCompat*/ Activity implements MediaPlaye
                     "IMG_"+ timeStamp + ".jpg");
         } else if(type == MEDIA_TYPE_VIDEO) {
             videoName = "VID_"+ timeStamp + ".mp4";
-            Log.e("tamar", "videoName="+videoName);
+//            Log.e("tamar", "videoName="+videoName);
             mediaFile = new File(mediaStorageDir.getPath() + File.separator + videoName);
         } else {
             return null;
         }
-        Log.e("tamar", "mediaf file="+mediaFile.getAbsolutePath());
         return mediaFile;
     }
 
     @Override
     protected void onPause() {
         super.onPause();
-        releaseMediaRecorder();       // if you are using MediaRecorder, release it first
-        releaseCamera();              // release the camera immediately on pause event
+//        Log.e("tamar", "in onPause");
+//        if (mediaRecorder != null) {
+        setCurrentStage(Stage.PAUSED);
+            handleRecordingMovesToBg(true);
+//        } else {
+//            releaseMediaRecorder();       // if you are using MediaRecorder, release it first
+//            releaseCamera();              // release the camera immediately on pause event
+//
+//        }
     }
 
     private void releaseMediaRecorder(){
-        Log.e("tamar", "in release MediaRecorder()!!!");
+//        Log.e("tamar", "in release MediaRecorder()!!!");
         if (mediaRecorder != null) {
             mediaRecorder.reset();   // clear recorder configuration
             mediaRecorder.release(); // release the recorder object
@@ -571,11 +634,18 @@ public class StitchActivity extends /*AppCompat*/ Activity implements MediaPlaye
     }
 
     public void onStopClicked(View view) {
-        stopRecording();
+        stopRecording(false);
     }
 
+    private long mLastClickTime = 0;
     public void onRecordClicked(View view) {
-        Log.e("tamar", "!!!!!!!!!!!!!in onRecordClicked!!!!!!");
+//        view.setEnabled(false);
+//        view.setClickable(false);
+        if (SystemClock.elapsedRealtime() - mLastClickTime < 1000){
+//            Log.e("tamar", "=======in onRecordClicked mLastClickTime="+mLastClickTime);
+            return;
+        }
+        mLastClickTime = SystemClock.elapsedRealtime();
         progressBar.setVisibility(View.VISIBLE);
         Camera.CameraInfo camera_info = new Camera.CameraInfo();
 //        int camera_orientation = camera_info.orientation;
@@ -603,33 +673,30 @@ public class StitchActivity extends /*AppCompat*/ Activity implements MediaPlaye
                 // Camera is available and unlocked, MediaRecorder is prepared,
                 // now you can start recording
 //                recBtn.setImageResource(R.drawable.inner_button_stop);
-                toggleRecBtn(false);
-                Log.e("tamar", "in prepare cal start MediaRecorder()!!!");
+//                toggleRecBtn(false);
+//                view.setEnabled(true);
+
                 mediaRecorder.start();
                 progressBar.setVisibility(View.VISIBLE);
-
+                cancelRecBtn.setVisibility(View.VISIBLE);
                 isRecording = true;
-
-                final ScheduledExecutorService service =
-                        Executors.newScheduledThreadPool(0);
-                service.scheduleWithFixedDelay(new Runnable() {
+                toggleRecBtn(false);
+                progressService = Executors.newScheduledThreadPool(0);
+                progressService.scheduleWithFixedDelay(new Runnable() {
                     int progress = 1;
                     @Override public void run() {
-//                        Log.e("tamar", "set progress before if:"+progress);
                         if(progress<=100) {
-//                            Log.e("tamar", "set progress to:"+progress);
                             progressBar.setProgress(++progress);
                         } else {
                             runOnUiThread(new Runnable() {
                                 @Override
                                 public void run() {
                                     progressBar.setVisibility(View.GONE);
-                                    Log.e("tamar", "isRecording="+isRecording);
                                     if(isRecording) {
-                                        stopRecording();
+                                        stopRecording(true);
                                     }
-                                    Log.e("tamar", "call service.shutdown");
-                                    service.shutdown();
+//                                    Log.e("tamar", "call service.shutdown");
+                                    progressService.shutdown();
                                 }
                             });
 
@@ -658,36 +725,101 @@ public class StitchActivity extends /*AppCompat*/ Activity implements MediaPlaye
     
     }
 
-    private void stopRecording(){
-        isRecording=false;
-        mediaPlayer.stop();    //pause();
-        Log.e("tamar", "stopping recording");
-        progressBar.setVisibility(View.GONE);
-
-        if(mediaRecorder!=null) {
-            mediaRecorder.setOnInfoListener(new MediaRecorder.OnInfoListener() {
-                @Override
-                public void onInfo(MediaRecorder mr, int what, int extra) {
-                    Log.e("tamar", "Recorder INFO="+what);
-                }
-            });
-            mediaRecorder.stop();  // stop the recording
-            releaseMediaRecorder(); // release the MediaRecorder object
-            mCamera.lock();         // take camera access back from MediaRecorder
-
-            // inform the user that recording has stopped
-//            setCaptureButtonText("Capture");
+    private void cancelRecording(){
+//        Log.e("tamar", "in cancelRecording...");
+        if(mediaPlayer!=null && mediaPlayer.getCurrentPosition() > 1500 && isRecording) { // since we cant get the media recorder duration we need to use the media player duration
+//            Log.e("tamar", "in cancelRecording...in if!");
             isRecording = false;
-//        callStitchApi(charID);
-        }
+//            mediaPlayer.stop();    //pause();
+            progressService.shutdown();
+            progressBar.setProgress(0);
+            progressBar.setVisibility(View.GONE);
+            cancelRecBtn.setVisibility(View.GONE);
 
-        try {
-            callStitchApi(charID);
-        } catch (IOException e) {
-            e.printStackTrace();
+            if (mediaRecorder != null) {
+                mediaRecorder.stop();  // stop the recording
+                releaseMediaRecorder(); // release the MediaRecorder object
+                mCamera.lock();         // take camera access back from MediaRecorder
+
+                // inform the user that recording has stopped
+//            setCaptureButtonText("Capture");
+                isRecording = false;
+            }
+            toggleRecBtn(true);
+        }
+//        Log.e("tamar", "in cancelRecording...after if!");
+    }
+
+    private void stopRecording(boolean hasVideoEnded){
+//        Log.e("tamar", "in stopRecording, mediaPlayer.getCurrentPosition="+mediaPlayer.getCurrentPosition());
+        // Android bug causes crash when calling stop media recorder right after start
+        if((hasVideoEnded || mediaPlayer!=null && mediaPlayer.getCurrentPosition() > 1500) && isRecording) { // since we cant get the media recorder duration we need to use the media player duration
+            isRecording = false;
+            mediaPlayer.stop();    //pause();
+//            Log.e("tamar", "stopping recording");
+            progressService.shutdown();
+            progressBar.setVisibility(View.GONE);
+            cancelRecBtn.setVisibility(View.GONE);
+            if (mediaRecorder != null) {
+                mediaRecorder.stop();  // stop the recording
+                releaseMediaRecorder(); // release the MediaRecorder object
+                mCamera.lock();         // take camera access back from MediaRecorder
+
+                // inform the user that recording has stopped
+//            setCaptureButtonText("Capture");
+                isRecording = false;
+//        callStitchApi(charID);
+            }
+
+            try {
+                callStitchApi(charID);
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
         }
     }
 
+
+    @Override
+    public void onBackPressed() {
+        setCurrentStage(Stage.ABORTED);
+//        Log.e("tamar", "current stage=" + getCurrentStage().name());
+        if(isRecording) {
+            cancelRecording();
+        }
+        super.onBackPressed();
+        finish();
+    }
+
+    private void cancelInteruptedRecording(){
+//        Log.e("tamar", "in cancelInteruptedRecording...");
+//        if(mediaPlayer!=null && mediaPlayer.getCurrentPosition() > 1500 && isRecording) { // since we cant get the media recorder duration we need to use the media player duration
+//            Log.e("tamar", "in cancelRecording...in if!");
+        isRecording = false;
+//            mediaPlayer.stop();    //pause();
+        if(progressService!=null) {
+            progressService.shutdown();
+            progressBar.setProgress(0);
+            progressBar.setVisibility(View.GONE);
+            cancelRecBtn.setVisibility(View.GONE);
+        }
+
+
+        if (mediaRecorder != null) {
+            mediaRecorder.stop();  // stop the recording
+            releaseMediaRecorder(); // release the MediaRecorder object
+            mCamera.lock();         // take camera access back from MediaRecorder
+        }
+        toggleRecBtn(true);
+//        }
+//        Log.e("tamar", "in cancelInteruptedRecording...after if! fileToPlay="+fileToPlay);
+        initScreen(false);
+        animateLoadingScreen(false);
+//        showCameraAndPlayVid();
+        if(fileToPlay!=null) {
+            showCameraPreview();
+        }
+    }
 
     //    /* SurfaceHolder.Callback */
 //
@@ -707,13 +839,13 @@ public class StitchActivity extends /*AppCompat*/ Activity implements MediaPlaye
 //    }
     @Override
     public <T> void onResponseSuccess(RequestType requestType, T object, Object extra) {
-        Log.e(TAG, "in onResponseSuccess!!!");
+//        Log.e(TAG, "in onResponseSuccess!!!");
         switch (requestType) {
             case GET_CHAR:
                 fCharacter = (Character) object;
                 if(object!=null){
-                    setAppOrientation(fCharacter.orientation);
-                    Log.e(TAG, "in onResponseSuccess!!! object="+object.getClass());
+                    setActivityOrientation(fCharacter.orientation);
+//                    Log.e(TAG, "in onResponseSuccess!!! object="+object.getClass());
 //                    Log.e(TAG, "in onResponseSuccess!!! object vid path="+((Character)object).getVideo_path());
                     ((Character) object).print();
 //                    setCameraPriviewSize(fCharacter.getWidth(), fCharacter.getHeight());
@@ -733,8 +865,8 @@ public class StitchActivity extends /*AppCompat*/ Activity implements MediaPlaye
         }
     }
 
-    private void setAppOrientation(String orientation) {
-        Log.e("tamar", "in setAppOrientation!!!s orientation="+orientation);
+    private void setActivityOrientation(String orientation) {
+//        Log.e("tamar", "in setAppOrientation!!!s orientation="+orientation);
         if(orientation.equalsIgnoreCase("horizontal")) {
 //            setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_PORTRAIT);
             setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE);
@@ -747,7 +879,8 @@ public class StitchActivity extends /*AppCompat*/ Activity implements MediaPlaye
 
     private void downloadCharVid(Character charcterToDownlad) {
         Log.e(TAG, "in downloadCharVid!!! video url="+charcterToDownlad.getVideo_path());
-        final File downloadFile =  getOutputMediaFile(MEDIA_TYPE_VIDEO);
+//        final File downloadFile =  getOutputMediaFile(MEDIA_TYPE_VIDEO);
+        downloadFile =  getOutputMediaFile(MEDIA_TYPE_VIDEO);
 //        public void downloadPreviewVideo(){
 //            try {
 
@@ -755,7 +888,6 @@ public class StitchActivity extends /*AppCompat*/ Activity implements MediaPlaye
 //                    try {
                         String timestamp = new SimpleDateFormat("yyyyMMddhhmmss").format(new Date());
                         File recordedFile = new File(getFilesDir()+ File.separator+ "vids" + File.separator + "video_"+ timestamp +".mp4");
-
                         final OKHttpFileDownloader downloader = new OKHttpFileDownloader(new OkHttpClient(), fCharacter.getVideo_path(),
                                 downloadFile, new OKHttpFileDownloader.ProgressListener() {
 
@@ -773,10 +905,10 @@ public class StitchActivity extends /*AppCompat*/ Activity implements MediaPlaye
                             @Override
                             public void onCompleted() {
                                 Log.e("tamar", "download completed: "+downloadFile );
-
-                                showCameraPreview();
-                                Log.e("tamar", "^^^^^call show video "+downloadFile );
-                                showVideo(downloadFile);
+                                showCameraAndPlayVid();
+//                                showCameraPreview();
+//                                Log.e("tamar", "^^^^^call show video "+downloadFile );
+//                                showVideo(downloadFile);
 //                                Log.e("tamar", "^^^^^call show video "+downloadFile );
 //                                showVideo(downloadFile);
 //                                loadingFirst.dismiss();
@@ -793,10 +925,18 @@ public class StitchActivity extends /*AppCompat*/ Activity implements MediaPlaye
 
     }
 
+    private void showCameraAndPlayVid() {
+        showCameraPreview();
+//        Log.e("tamar", "^^^^^call show video "+downloadFile );
+        showVideo(downloadFile);
+    }
+
 
     private void downloadStitchedVid(String vidUrl) {
         Log.e("tamar", "in downloadStitchedVid!!! video url="+vidUrl);
         final File downloadFile =  getOutputMediaFile(MEDIA_TYPE_VIDEO);
+        setCurrentStage(Stage.STITCHED_VIDEO_DOWNLOADING);
+        Log.e("tamar", "in downloadStitchedVid current stage=" + getCurrentStage().name());
 //        public void downloadPreviewVideo(){
 //            try {
 
@@ -808,6 +948,7 @@ public class StitchActivity extends /*AppCompat*/ Activity implements MediaPlaye
         final OKHttpFileDownloader downloader = new OKHttpFileDownloader(new OkHttpClient(), vidUrl,
                 downloadFile, new OKHttpFileDownloader.ProgressListener() {
 
+
             @Override
             public void onProgress(int percents) {
 
@@ -815,43 +956,54 @@ public class StitchActivity extends /*AppCompat*/ Activity implements MediaPlaye
 
             @Override
             public void onCompleted() {
-                Log.e("tamar", "download completed2: "+downloadFile );
-                animateLoadingScreen(false);
+
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        Log.e("tamar", "download completed2: " + downloadFile + "  current stage=" + getCurrentStage().name());
+                        if (getCurrentStage() == Stage.STITCHED_VIDEO_DOWNLOADING) {
+//                            animateLoadingScreen(false);
 //                loading.dismiss();
-                releaseMediaRecorder();
+                            releaseMediaRecorder();
 //                FrameLayout camerPreview = (FrameLayout) findViewById(R.id.camera_video);
 //                camerPreview.removeView(mPreview);
-                if(showShareScreen) {
-                    Intent shareIntent = new Intent(StitchActivity.this, ShareStitch.class);
-                    Log.e("tamar", "download completed3: " + downloadFile);
-                    if (downloadFile != null && downloadFile.exists()) {
-                        Log.e("tamar", "^^^^^^^^download completed4 FILE NOT NULL!!!: " + downloadFile);
-                        String recordedFilePath = downloadFile.getAbsolutePath();
-                        shareIntent.putExtra(ShareStitch.RECORDER_FILE_PATH, recordedFilePath);
-                        shareIntent.putExtra(ShareStitch.RECORDER_FILE_LENGTH, fCharacter.getLength());
-                        shareIntent.putExtra(StitchActivity.SHARE_TO_INSTAGRAM, showInstagramShare);
-                        shareIntent.putExtra(StitchActivity.SHARE_TO_FACEBOOK, showFacebookShare);
-                        shareIntent.putExtra(StitchActivity.SHARE_TO_MORE, showMoreShare);
-                        shareIntent.putExtra(StitchActivity.SHARE_TO_TIKTOK, showTiktokShare);
-                        startActivityForResult(shareIntent, SHARE_ACTIVITY_REQ_CODE);
-                    } else {
-                        //todo: handle problem
+                            if (showShareScreen) {
+                                Intent shareIntent = new Intent(StitchActivity.this, ShareStitch.class);
+                                Log.e("tamar", "download completed3: " + downloadFile);
+                                if (downloadFile != null && downloadFile.exists()) {
+                                    Log.e("tamar", "^^^^^^^^download completed4 FILE NOT NULL!!!: " + downloadFile);
+                                    String recordedFilePath = downloadFile.getAbsolutePath();
+                                    shareIntent.putExtra(ShareStitch.ACTIVITY_ORIENTATION, fCharacter.orientation);
+                                    shareIntent.putExtra(ShareStitch.RECORDER_FILE_PATH, recordedFilePath);
+                                    shareIntent.putExtra(ShareStitch.RECORDER_FILE_LENGTH, fCharacter.getLength());
+                                    shareIntent.putExtra(StitchActivity.SHARE_TO_INSTAGRAM, showInstagramShare);
+                                    shareIntent.putExtra(StitchActivity.SHARE_TO_FACEBOOK, showFacebookShare);
+                                    shareIntent.putExtra(StitchActivity.SHARE_TO_MORE, showMoreShare);
+                                    shareIntent.putExtra(StitchActivity.SHARE_TO_TIKTOK, showTiktokShare);
+//                                    animateLoadingScreen(false);
+                                    Log.e("tamar", "call share activity ");
+                                    startActivityForResult(shareIntent, SHARE_ACTIVITY_REQ_CODE);
+
+                                } else {
+                                    //todo: handle problem
+                                }
+                            } else {
+                                //todo: return the file destination to the calling app
+                                Intent resultIntent = new Intent();
+                                resultIntent.putExtra(STITCHED_FILE_PATH, downloadFile.getAbsolutePath());
+                                setResult(Activity.RESULT_OK, resultIntent);
+                                finish();
+                            }
+                        }
                     }
-                } else {
-                    //todo: return the file destination to the calling app
-                    Intent resultIntent = new Intent();
-                    resultIntent.putExtra(STITCHED_FILE_PATH, downloadFile.getAbsolutePath());
-                    setResult(Activity.RESULT_OK, resultIntent);
-                    finish();
-                }
+                });
+
             }
 
             @Override
             public void onFailed() {
                 Log.e("tamar", "download failed!!!---- "+downloadFile);
             }
-
-
         });
         downloader.execute();
 
@@ -859,7 +1011,7 @@ public class StitchActivity extends /*AppCompat*/ Activity implements MediaPlaye
 
 
     private void showCameraPreview() {
-        numberOfCameras = Camera.getNumberOfCameras();
+//        numberOfCameras = Camera.getNumberOfCameras();
 //        cameraHolder = (AspectLockedFrameLayout) findViewById(R.id.camera_video);
 //        cameraHolder.setAspectRatio(16.0/9.0);
         // Create an instance of Camera
@@ -881,17 +1033,13 @@ public class StitchActivity extends /*AppCompat*/ Activity implements MediaPlaye
 ////        mCamera.startPreview();
 
         // Create our Preview view and set it as the content of our activity.
-        mPreview = new CameraPreviewBase(this, mCamera);
+//        mPreview = new CameraPreviewBase(this, mCamera);
 
         camerPreview = (FrameLayout) findViewById(R.id.camera_video);
         //set the priview size according to video size
         ViewGroup.LayoutParams cameraHolderParams = camerPreview.getLayoutParams();
-//        Log.e("tamar", "Setting height of " + previewHeight+" width="+previewWidth);
-        Log.e("tamar", "width11111="+cameraHolderParams.width);
         cameraHolderParams.width = fCharacter.getWidth();
-        Log.e("tamar", "width22222="+cameraHolderParams.width);
         cameraHolderParams.height = fCharacter.getHeight();
-        Log.e("tamar", "height11111="+cameraHolderParams.height);
         camerPreview.setLayoutParams(cameraHolderParams);
 
         camerPreview.addView(mPreview);
@@ -901,18 +1049,7 @@ public class StitchActivity extends /*AppCompat*/ Activity implements MediaPlaye
 
     @Override
     public void onResponseFail(RequestType requestType, VolleyError error, Object extra) {
-//        switch (requestType) {
-//            case ARTIST:
-//                if(followBtn!=null) {
-//                    followBtn.setVisibility(View.INVISIBLE);
-//                }
-                Log.e(TAG, "in onResponseFail:error getting character data=" + error.getMessage());
-//                break;
-//
-//            case SONG_DETAILS:
-//                FLog.e(TAG, "in onResponseFail:error getting Song data for artist=" + error.getMessage());
-//                break;
-//        }
+        Log.e(TAG, "in onResponseFail:error getting character data=" + error.getMessage());
     }
 
 
@@ -959,7 +1096,8 @@ public class StitchActivity extends /*AppCompat*/ Activity implements MediaPlaye
             } else {
                 Log.e("tamar", "videoBytes is NULL!!!");
             }
-
+        setCurrentStage(Stage.CALL_STITCH_API);
+        Log.e("tamar", "in callStitchApi current stage=" + getCurrentStage().name());
         String POST_URL =  "https://fuseit-video-terminal-alt.appspot.com/api/stitch-character/"+charId;
 //        loading = ProgressDialog.show(this, "Posting", "Please wait...", false, false);
         animateLoadingScreen(true);
@@ -967,6 +1105,7 @@ public class StitchActivity extends /*AppCompat*/ Activity implements MediaPlaye
             @Override
             public void onResponse(NetworkResponse response) {
 //                loading.dismiss();
+                Log.e("tamar", "in onResponse current stage=" + getCurrentStage().name());
                 if(response!=null) {
 
                     String resultResponse = new String(response.data);
@@ -980,7 +1119,15 @@ public class StitchActivity extends /*AppCompat*/ Activity implements MediaPlaye
                         Log.e("tamar", "=======response vid path=" + parsedResponse.getClass());
                         String videoPath = ((StitchedVideo) parsedResponse).getPath();
                         Log.e("tamar", "=======response vid path=" + videoPath);
-                        downloadStitchedVid(videoPath);
+                        Log.e("tamar", "in call api onResponse current stage=" + getCurrentStage().name());
+                        if(getCurrentStage()==Stage.CALL_STITCH_API) { //if activity was aborted or paused dont continue
+                            downloadStitchedVid(videoPath);
+                        }
+//                        else if (getCurrentStage()==Stage.PAUSED) {
+//                            //if in the future we want to handle recorded video we should do it here
+                        //for example show a dialog or message that a previously created video is ready
+//                        }
+
                     } else {
                         Log.e("tamar", "===parsedResponse is Null");
                     }
@@ -991,6 +1138,7 @@ public class StitchActivity extends /*AppCompat*/ Activity implements MediaPlaye
         }, new Response.ErrorListener() {
             @Override
             public void onErrorResponse(VolleyError error) {
+                Log.e("tamar", "===in onErrorResponse error="+error.getMessage());
 //                loading.dismiss();
                 NetworkResponse networkResponse = error.networkResponse;
                 String errorMessage = "Unknown error";
@@ -1072,52 +1220,42 @@ public class StitchActivity extends /*AppCompat*/ Activity implements MediaPlaye
     /* permissions related code */
     @TargetApi(23)
     private boolean permissionsAllowed() {
-        Log.e("tamar", "in permissionsAllowed");
-        missingPermissionsList.clear();
-        boolean permissionsAllowed = true;
-        int currentapiVersion = android.os.Build.VERSION.SDK_INT;
-        if (currentapiVersion < 23) {
-            return true;
-        }
-
-        if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
-            missingPermissionsList.add(Manifest.permission.CAMERA);
-            permissionsAllowed = false;
-        } else {
-            SharedPrefsManager.getInstance(getApplicationContext()).setPermissionAllowed(Manifest.permission.CAMERA);
-        }
-
-        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            missingPermissionsList.add(Manifest.permission.RECORD_AUDIO);
-            permissionsAllowed = false;
-        } else {
-            SharedPrefsManager.getInstance(getApplicationContext()).setPermissionAllowed(Manifest.permission.RECORD_AUDIO);
-        }
-
-        if (checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
-            missingPermissionsList.add(Manifest.permission.WRITE_EXTERNAL_STORAGE);
-            permissionsAllowed = false;
-        } else {
-            SharedPrefsManager.getInstance(getApplicationContext()).setPermissionAllowed(Manifest.permission.WRITE_EXTERNAL_STORAGE);
-        }
-
-        if(missingPermissionsList.size() > 0) {
-            if(SharedPrefsManager.getInstance(getApplicationContext()).isPermissionNeverDetected()) {
-                showPermissionsExplainScreen(true);
-            } else {
-                showPermissionsExplainScreen(false);
+            missingPermissionsList.clear();
+            boolean permissionsAllowed = true;
+            int currentapiVersion = android.os.Build.VERSION.SDK_INT;
+            if (currentapiVersion < 23) {
+                return true;
             }
 
-        }
-        Log.e("tamar", "in permissionsAllowed missingPermissionsList size="+missingPermissionsList.size()+ "   permissionsAllowed="+permissionsAllowed);
-        return permissionsAllowed;
+            if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+                missingPermissionsList.add(Manifest.permission.CAMERA);
+                permissionsAllowed = false;
+            } else {
+                SharedPrefsManager.getInstance(getApplicationContext()).setPermissionAllowed(Manifest.permission.CAMERA);
+            }
+
+            if (checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
+                missingPermissionsList.add(Manifest.permission.WRITE_EXTERNAL_STORAGE);
+                permissionsAllowed = false;
+            } else {
+                SharedPrefsManager.getInstance(getApplicationContext()).setPermissionAllowed(Manifest.permission.WRITE_EXTERNAL_STORAGE);
+            }
+
+            if (missingPermissionsList.size() > 0) {
+                if (SharedPrefsManager.getInstance(getApplicationContext()).isPermissionNeverDetected()) {
+                    showPermissionsExplainScreen(true);
+                } else {
+                    showPermissionsExplainScreen(false);
+                }
+
+            }
+            return permissionsAllowed;
     }
 
 
     private void setGrantedPermsInUI(Dialog showPermissionsNeededDialog) {
         TextView cameraCheck = (TextView)showPermissionsNeededDialog.findViewById(R.id.camera_permission);
         TextView storageCheck = (TextView)showPermissionsNeededDialog.findViewById(R.id.storage_permission);
-        TextView micCheck = (TextView)showPermissionsNeededDialog.findViewById(R.id.mic_permission);
         TextView grantBtn = (TextView)showPermissionsNeededDialog.findViewById(R.id.grant_permissions);
 
         if (missingPermissionsList.contains(Manifest.permission.CAMERA)) {
@@ -1130,12 +1268,6 @@ public class StitchActivity extends /*AppCompat*/ Activity implements MediaPlaye
         } else {
             storageCheck.setTextColor(getResources().getColor(android.R.color.darker_gray));
         }
-        if (missingPermissionsList.contains(Manifest.permission.RECORD_AUDIO)) {
-
-            micCheck.setTextColor(getResources().getColor(android.R.color.holo_blue_bright));
-        } else {
-            micCheck.setTextColor(getResources().getColor(android.R.color.darker_gray));
-        }
     }
 
 
@@ -1145,7 +1277,6 @@ public class StitchActivity extends /*AppCompat*/ Activity implements MediaPlaye
             showPermissionsNeededDialog.dismiss();
             showPermissionsNeededDialog=null;
         }
-      //  showPermissionsNeededDialog.cancel();
         String openSettings = getResources().getString(R.string.open_settings);
         String btnText = grantTv.getText().toString();
         if (btnText.equalsIgnoreCase(openSettings)) {
@@ -1182,7 +1313,6 @@ public class StitchActivity extends /*AppCompat*/ Activity implements MediaPlaye
                     }
                 }
             }
-
             if(permissionsRequestNeededList.size() > 0 && permissionsNeverGrantedList.size() == 0) {  //todo: check this - tamar
                 requestNeededPermission(permissionsRequestNeededList);
             }
@@ -1229,7 +1359,6 @@ public class StitchActivity extends /*AppCompat*/ Activity implements MediaPlaye
                         } else {
                             boolean isNever = checkIfNever(permission);
                             if(isNever) {
-                                Log.e("tamar", "in never");
                                 SharedPrefsManager.getInstance(getApplicationContext()).setPermissionNeverDetected();
                             }
                         }
@@ -1276,13 +1405,10 @@ public class StitchActivity extends /*AppCompat*/ Activity implements MediaPlaye
     }
 
     private boolean checkAllNeededPermissionsAllowed() {
-        Log.e("tamar", "in checkAllNeededPermissionsAllowed");
         SharedPrefsManager sharedPrefMngr = SharedPrefsManager.getInstance(getApplicationContext());
         boolean cameraAllowed = sharedPrefMngr.isPermissionAllowed(Manifest.permission.CAMERA);
         boolean phoneAllowed = sharedPrefMngr.isPermissionAllowed(Manifest.permission.WRITE_EXTERNAL_STORAGE);
-        boolean micAllowed = sharedPrefMngr.isPermissionAllowed(Manifest.permission.RECORD_AUDIO);
-        if(cameraAllowed && phoneAllowed && micAllowed) {
-            Log.e("tamar", "in checkAllNeededPermissionsAllowed return true");
+        if(cameraAllowed && phoneAllowed) { // && micAllowed) {
             return true;
         } else {
             return false;
@@ -1298,19 +1424,18 @@ public class StitchActivity extends /*AppCompat*/ Activity implements MediaPlaye
 
         setGrantedPermsInUI(showPermissionsNeededDialog);
         TextView grantTv = (TextView)showPermissionsNeededDialog.findViewById(R.id.grant_permissions);
-//        Button nextBtn= (Button)showPermissionsNeededDialog.findViewById(R.id.perms_button);
-//        nextBtn.setOnClickListener(new View.OnClickListener() {
-//            @Override
-//            public void onClick(View v) {
-//                handlePermissionsNextMove(v);
-//            }
-//        });
-        String permissionsNeeded = "test222 test222 test222";
+        ImageView closeDialog = (ImageView)showPermissionsNeededDialog.findViewById(R.id.close_permissions);
+        closeDialog.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                showPermissionsNeededDialog.dismiss();
+                showPermissionsNeededDialog = null;
+                finish();
+            }
+        });
+
         if(never) {
             grantTv.setText(getResources().getString(R.string.open_settings));
-//  tamar          permissionsNeeded = getResources().getString(R.string.permissions_needed_never_pressed);
-//            titleTv.setText(permissionsNeeded);
-//            nextBtn.setText(getResources().getString(R.string.open_settings));
         } else {
             grantTv.setText(getResources().getString(R.string.grant_permissions));
             if (SharedPrefsManager.getInstance(getApplicationContext()).isFirstTimeExplainShown()) {
@@ -1319,8 +1444,6 @@ public class StitchActivity extends /*AppCompat*/ Activity implements MediaPlaye
             } else {
 //                permissionsNeeded = getResources().getString(R.string.permissions_still_needed);
             }
-//            titleTv.setText(permissionsNeeded);    //or permissions_still_needed
-//            nextBtn.setText(getResources().getString(R.string.grant_permissions));
         }
 
         Window window = showPermissionsNeededDialog.getWindow();
@@ -1330,11 +1453,20 @@ public class StitchActivity extends /*AppCompat*/ Activity implements MediaPlaye
         wlp.flags &= ~WindowManager.LayoutParams.FLAG_BLUR_BEHIND;
         window.setAttributes(wlp);
         showPermissionsNeededDialog.getWindow().setLayout(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.MATCH_PARENT);
+        showPermissionsNeededDialog.setOnCancelListener(new DialogInterface.OnCancelListener()
+        {
+            @Override
+            public void onCancel(DialogInterface dialog)
+            {
+                dialog.dismiss();
+                finish();
+            }
+        });
         showPermissionsNeededDialog.show();
     }
 
     private void animateLoadingScreen(boolean showLoadingScreen) {
-        Log.e("tamar", "^^^^^^^^in animateLoadingScreen showLoadingScreen="+showLoadingScreen);
+//        Log.e("tamar", " in animate...="+showLoadingScreen);
 //        Transition transition = new Fade();
 //        Transition transition = new Slide(Gravity.BOTTOM);
         Transition transition = new CircularRevealTransition();
@@ -1348,27 +1480,113 @@ public class StitchActivity extends /*AppCompat*/ Activity implements MediaPlaye
 
     @Override
     public void surfaceCreated(SurfaceHolder holder) {
-        Log.e("tamar", "^^^^^^^^in surfaceCreated");
+//        Log.e("tamar", "in in surfaceCreated Activity!!!");
         try {
-            mediaPlayer = new MediaPlayer();
-            mediaPlayer.setDisplay(vidHolder);
-//            mediaPlayer.setDataSource(fileToPlay.getAbsolutePath());
-//            mediaPlayer.prepare();
-            mediaPlayer.setOnPreparedListener(this);
-            mediaPlayer.setAudioStreamType(AudioManager.STREAM_MUSIC);
+            initMediaPlayer();
         }
         catch(Exception e){
             e.printStackTrace();
         }
     }
 
+    private void initMediaPlayer() {
+//        Log.e("tamar", "in initMediaPlayer!!!");
+        mediaPlayer = new MediaPlayer();
+        isMediaPlayerReleased = false;
+        mediaPlayer.setDisplay(vidHolder);
+        mediaPlayer.setOnPreparedListener(this);
+        mediaPlayer.setAudioStreamType(AudioManager.STREAM_MUSIC);
+        if(downloadFile != null && downloadFile.exists()) {
+            showVideo(downloadFile);
+        }
+    }
+
     @Override
     public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
-        Log.e("tamar", "^^^^^^^^in surfaceChanged");
     }
 
     @Override
     public void surfaceDestroyed(SurfaceHolder holder) {
-        Log.e("tamar", "^^^^^^^^in surfaceDestroyed");
+    }
+
+    public void onCloseClicked(View view) {
+        cancelRecording();
+    }
+
+    private void handleRecordingMovesToBg(boolean setPaused) { //call in onPause
+        videoWasPaused = setPaused;
+        clearRecording();
+        releaseMediaRecorder();
+        releaseCamera();
+        audioManager.abandonAudioFocus(this);
+    }
+
+    @Override
+    public void onResume() {
+        super.onResume();
+//        Log.e("tamar", "in onResume videoWasPaused="+videoWasPaused);
+        if(videoWasPaused) {
+            videoWasPaused = false;
+//            Log.e("tamar", "in onResume currentOutputFile="+currentOutputFile);
+//            if(!TextUtils.isEmpty(currentOutputFile)){
+                cancelInteruptedRecording();
+//
+//            } else {
+////                showErrorDialog(AlertDialogType.RECORDING_INTERRUPT, getActivity());
+//            }
+        } else {
+//            Log.e("tamar", "in onResume call show dialog");
+//            if (getModel().getArtistVideoPath().exists()) {
+//                showScreen();
+//            } else {
+//                callback.OnVideoNotFound();
+//            }
+        }
+    }
+
+
+    private synchronized void clearRecording(){
+        if(!isRecording){
+            return;
+        }
+        isRecording=false;
+
+//        normalizeAudio();
+        mediaPlayer.stop();
+
+        mediaPlayer.release();
+        isMediaPlayerReleased = true;
+
+
+//        if(camera.isRecording()){
+//            try{
+//                camera.stopRecording();
+//            }catch (Exception e){
+//                Log.e(TAG, String.format("Error stopping camera %s", e));
+//            }
+//        }
+    }
+
+    private boolean isRecordingLengthTooShort(){
+        if(mediaPlayer != null) {
+            return mediaPlayer.getCurrentPosition() / MS_PER_FRAME / ORIGINAL_FPS < MINIMUM_RECORD_TIME;
+        }
+        return false;
+    }
+
+    @Override
+    public void onAudioFocusChange(int focusChange) {
+
+    }
+
+    protected void showErrorDialog(AlertDialogType dialogType, Context context) {
+
+//        //todo: add active indication
+//        AlertDialogSupportFragment.showAlertDialog(getFragmentManager(),
+//                dialogType.ordinal(),
+//                dialogType.name(),
+//                this,
+//                AlertDialogContentFactory.createDialogContent(context, dialogType));
+
     }
 }

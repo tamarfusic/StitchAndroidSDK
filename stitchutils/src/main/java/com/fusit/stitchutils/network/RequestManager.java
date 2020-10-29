@@ -61,6 +61,7 @@ public class RequestManager<T> {
         }
     }
 
+
 //    public ImageLoader getImageLoader () {
 //        if(imageLoader == null){
 //            createImageLoader();

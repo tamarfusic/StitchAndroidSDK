@@ -40,9 +40,9 @@ public class CameraPreviewBase extends SurfaceView implements SurfaceHolder.Call
     public void surfaceCreated(SurfaceHolder holder) {
         // The Surface has been created, now tell the camera where to draw the preview.
         try {
+           Log.e("tamar", "in surfaceCreated camera="+mCamera);
             mCamera.setPreviewDisplay(holder);
             mCamera.startPreview();
-            Log.e("tamar", "setDisplayOrientation1=90");
 //            mCamera.setDisplayOrientation(90);
         } catch (IOException e) {
             Log.d(TAG, "Error setting camera preview: " + e.getMessage());
@@ -108,7 +108,6 @@ public class CameraPreviewBase extends SurfaceView implements SurfaceHolder.Call
 
             setCameraDisplayOrientation(activity,0,mCamera);
             mCamera.setPreviewDisplay(mHolder);
-            Log.e("tamar", "setDisplayOrientation333");
 //            if (Build.VERSION.SDK_INT >= 8) {
 //                mCamera.setDisplayOrientation(90);
 //            }
@@ -145,7 +144,6 @@ public class CameraPreviewBase extends SurfaceView implements SurfaceHolder.Call
             result = (info.orientation - degrees + 360) % 360;
         }
 //        degrees=0;
-        Log.e("tamar", "***degrees="+degrees);
         StitchActivity.orientation=degrees;
 //        camera.setDisplayOrientation(degrees);
         try {

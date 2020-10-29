@@ -129,6 +129,7 @@ public class RecorderCamera implements CameraPreview.OnSurfaceCreated {
                 mediaRecorder.setVideoEncodingBitRate(900 * 1024);
                 mediaRecorder.setAudioEncodingBitRate(64 * 1024);
                 mediaRecorder.setAudioSamplingRate(44100);
+                Log.e("tamar", "setVideoSize= width="+bestSize.width+"   hieght="+bestSize.height);
                 mediaRecorder.setVideoSize(bestSize.width, bestSize.height);
                 mediaRecorder.setOrientationHint(finalRotation);
                 mediaRecorder.prepare();
